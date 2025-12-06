@@ -74,10 +74,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		model = "gemini-2.5-flash"
 	}
 	args = append(args, "-m", model)
+	// Explicitly disable extensions and MCP servers
+	args = append(args, "--extensions", "", "--allowed-mcp-server-names", "")
 
 	log.Printf("Calling gemini-cli with args: %v", args)
 
 	cmd := exec.Command(geminiCLI, args...)
+	// Run in temp dir to avoid polluting context with current directory files
+	cmd.Dir = os.TempDir()
 
 	// Pipe the formatted input to gemini-cli's stdin
 	cmd.Stdin = strings.NewReader(geminiInput)
