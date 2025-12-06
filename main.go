@@ -48,8 +48,23 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Determine if streaming is requested
 	isStream := req.Stream
 
-	// Format messages into a single transcript for gemini-cli
-	geminiInput := buildGeminiInput(req.Messages)
+	// Extract system prompt and format messages
+	systemPrompt, geminiInput := parseMessages(req.Messages)
+
+	// Create a temporary file for the system prompt
+	sysPromptFile, err := os.CreateTemp("", "gemini-sys-prompt-*.md")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create temp system prompt file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer os.Remove(sysPromptFile.Name()) // Clean up temp file
+
+	// Write system prompt to file
+	if _, err := sysPromptFile.WriteString(systemPrompt); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to write to temp system prompt file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	sysPromptFile.Close()
 
 	// Build the gemini-cli command
 	args := []string{}
@@ -82,6 +97,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.Command(geminiCLI, args...)
 	// Run in temp dir to avoid polluting context with current directory files
 	cmd.Dir = os.TempDir()
+
+	// Set environment variable for system prompt
+	cmd.Env = append(os.Environ(), "GEMINI_SYSTEM_MD="+sysPromptFile.Name())
 
 	// Pipe the formatted input to gemini-cli's stdin
 	cmd.Stdin = strings.NewReader(geminiInput)
@@ -239,24 +257,38 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(models)
 }
 
-// buildGeminiInput formats the OpenAI messages into a single string for gemini-cli stdin.
-func buildGeminiInput(messages []OpenAIMessage) string {
-	var builder strings.Builder
+// parseMessages extracts the system prompt and formats the remaining messages for gemini-cli.
+func parseMessages(messages []OpenAIMessage) (string, string) {
+	var systemPromptBuilder strings.Builder
+	var transcriptBuilder strings.Builder
+	
+	// Default system prompt if none provided
+	defaultSystemPrompt := "You are a helpful AI assistant."
+	hasSystemPrompt := false
+
 	for _, msg := range messages {
 		switch msg.Role {
 		case "system":
-			builder.WriteString("System: " + msg.Content + "\n")
+			systemPromptBuilder.WriteString(msg.Content + "\n")
+			hasSystemPrompt = true
 		case "user":
-			builder.WriteString("User: " + msg.Content + "\n")
+			transcriptBuilder.WriteString("User: " + msg.Content + "\n")
 		case "assistant":
-			builder.WriteString("Model: " + msg.Content + "\n")
+			transcriptBuilder.WriteString("Model: " + msg.Content + "\n")
 		}
 	}
+	
+	systemPrompt := systemPromptBuilder.String()
+	if !hasSystemPrompt {
+		systemPrompt = defaultSystemPrompt
+	}
+
 	// Append "Model:" at the end if the last message was "user" to prime for completion
 	if len(messages) > 0 && messages[len(messages)-1].Role == "user" {
-		builder.WriteString("Model:")
+		transcriptBuilder.WriteString("Model:")
 	}
-	return builder.String()
+	
+	return systemPrompt, transcriptBuilder.String()
 }
 
 // generateID creates a simple placeholder ID for OpenAI responses
