@@ -43,6 +43,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Incoming request. Requested Model: %s", req.Model)
+
 	// Determine if streaming is requested
 	isStream := req.Stream
 
@@ -59,14 +61,21 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Use specified model, or default if not provided/recognized
 	model := req.Model
-	if model == "" {
-		// Default to a common Gemini model if OpenAI model name is used
+	switch model {
+	case "gemini-2.5-flash":
+		// Explicitly supported
+	case "gemini-2.5-pro":
+		// Explicitly supported
+	case "gemini-3-pro-preview":
+		// Explicitly supported
+	// If the model is empty, or an OpenAI model name, or any other unsupported model
+	default:
+		log.Printf("Requested model '%s' not explicitly supported. Defaulting to 'gemini-2.5-flash'.", model)
 		model = "gemini-2.5-flash"
-	} else if strings.HasPrefix(model, "gpt-") || strings.HasPrefix(model, "davinci-") {
-		// Map common OpenAI models to a suitable Gemini model
-		model = "gemini-2.5-flash" // Or implement more sophisticated mapping
 	}
 	args = append(args, "-m", model)
+
+	log.Printf("Calling gemini-cli with args: %v", args)
 
 	cmd := exec.Command(geminiCLI, args...)
 
@@ -213,13 +222,14 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Println("Incoming request for /v1/models")
+
 	models := OpenAIModelsResponse{
 		Object: "list",
 		Data: []OpenAIModel{
 			{ID: "gemini-2.5-flash", Object: "model", Created: 1678886400, OwnedBy: "google"},
-			{ID: "gemini-1.5-pro", Object: "model", Created: 1678886400, OwnedBy: "google"},
-			{ID: "gemini-1.0-pro", Object: "model", Created: 1678886400, OwnedBy: "google"},
-			// Add more supported models if known
+			{ID: "gemini-2.5-pro", Object: "model", Created: 1678886400, OwnedBy: "google"},
+			{ID: "gemini-3-pro-preview", Object: "model", Created: 1678886400, OwnedBy: "google"},
 		},
 	}
 	json.NewEncoder(w).Encode(models)
