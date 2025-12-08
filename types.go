@@ -1,19 +1,69 @@
 package main
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // --- OpenAI API Structs ---
 
 type OpenAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role          string           `json:"role"`
+	Content       json.RawMessage  `json:"content"` // Use RawMessage to defer parsing
+	ParsedContent []OpenAIContentPart `json:"-"`         // To store the unmarshaled content
+}
+
+// Custom UnmarshalJSON for OpenAIMessage to handle flexible Content field
+func (m *OpenAIMessage) UnmarshalJSON(data []byte) error {
+	type Alias OpenAIMessage // Create an alias to avoid infinite recursion
+
+	aux := &struct{
+		*Alias
+	}{
+		Alias: (*Alias)(m),
+	}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	// Try to unmarshal Content as a string
+	var contentStr string
+	if err := json.Unmarshal(m.Content, &contentStr); err == nil {
+		// It's a string, convert to a single text part
+		m.ParsedContent = []OpenAIContentPart{{
+			Type: "text",
+			Text: contentStr,
+		}}
+	} else {
+		// It's not a string, try to unmarshal as an array of parts
+		var contentParts []OpenAIContentPart
+		if err := json.Unmarshal(m.Content, &contentParts); err == nil {
+			m.ParsedContent = contentParts
+		} else {
+			return fmt.Errorf("messages.content must be a string or an array of content parts")
+		}
+	}
+	return nil
+}
+
+type OpenAIContentPart struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *OpenAIImageURL `json:"image_url,omitempty"`
+}
+
+type OpenAIImageURL struct {
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"` // low, high, auto
 }
 
 type OpenAICompletionRequest struct {
-	Model    string          `json:"model"`
-	Messages []OpenAIMessage `json:"messages"`
-	Stream   bool            `json:"stream,omitempty"`
-	// Add other OpenAI parameters if needed, but they will be ignored by gemini-cli
-	Temperature float64 `json:"temperature,omitempty"`
-	MaxTokens   int     `json:"max_tokens,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []OpenAIMessage `json:"messages"`
+	Stream      bool            `json:"stream,omitempty"`
+	Temperature float64         `json:"temperature,omitempty"`
+	MaxTokens   int             `json:"max_tokens,omitempty"`
 }
 
 type OpenAICompletionResponse struct {
@@ -34,10 +84,10 @@ type OpenAICompletionChunk struct {
 }
 
 type OpenAIChoice struct {
-	Index        int            `json:"index"`
-	Message      OpenAIMessage  `json:"message,omitempty"`
-	Delta        OpenAIDelta    `json:"delta,omitempty"`
-	FinishReason string         `json:"finish_reason,omitempty"`
+	Index        int           `json:"index"`
+	Message      OpenAIMessage `json:"message,omitempty"`
+	Delta        OpenAIDelta   `json:"delta,omitempty"`
+	FinishReason string        `json:"finish_reason,omitempty"`
 }
 
 type OpenAIDelta struct {
@@ -62,7 +112,6 @@ type OpenAIModel struct {
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
 }
-
 
 // --- Gemini CLI Internal Structs (stream-json and json output) ---
 

@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv" // Added for strconv.Quote
 	"strings"
 	"time"
 )
@@ -43,36 +47,50 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Log the incoming request payload
+	requestPayload, _ := json.MarshalIndent(req, "", "  ")
+	log.Printf("Incoming Request Payload:\n%s", requestPayload)
+
 	log.Printf("Incoming request. Requested Model: %s", req.Model)
 
 	// Determine if streaming is requested
 	isStream := req.Stream
 
-	// Extract system prompt and format messages
-	systemPrompt, geminiInput := parseMessages(req.Messages)
+	// Create a unique temporary directory for this request
+	requestTempDir, err := os.MkdirTemp("", "gemini-proxy-request-*")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create request temporary directory: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer os.RemoveAll(requestTempDir) // Ensure cleanup of the temp directory
 
-	// Create a temporary file for the system prompt
-	sysPromptFile, err := os.CreateTemp("", "gemini-sys-prompt-*.md")
+	log.Printf("Created request temporary directory: %s", requestTempDir)
+
+	// Extract system prompt and format messages
+	systemPromptContent, geminiInput, err := parseMessages(req.Messages, requestTempDir)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to parse messages: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Create a temporary file for the system prompt within the request's temp directory
+	sysPromptFile, err := os.CreateTemp(requestTempDir, "sys-prompt-*.md")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create temp system prompt file: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer os.Remove(sysPromptFile.Name()) // Clean up temp file
+	// No need to os.Remove(sysPromptFile.Name()) here, as os.RemoveAll(requestTempDir) will handle it
 
 	// Write system prompt to file
-	if _, err := sysPromptFile.WriteString(systemPrompt); err != nil {
+	if _, err := sysPromptFile.WriteString(systemPromptContent); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to write to temp system prompt file: %v", err), http.StatusInternalServerError)
 		return
 	}
 	sysPromptFile.Close()
 
 	// Build the gemini-cli command
-	args := []string{}
-	if isStream {
-		args = append(args, "--output-format", "stream-json")
-	} else {
-		args = append(args, "--output-format", "json")
-	}
+	// Always use stream-json to ensure we can capture the session ID for cleanup
+	args := []string{"--output-format", "stream-json"}
 
 	// Use specified model, or default if not provided/recognized
 	model := req.Model
@@ -95,10 +113,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Calling gemini-cli with args: %v", args)
 
 	cmd := exec.Command(geminiCLI, args...)
-	// Run in temp dir to avoid polluting context with current directory files
-	cmd.Dir = os.TempDir()
+	// Set gemini-cli's working directory to the request's temp directory
+	cmd.Dir = requestTempDir
 
-	// Set environment variable for system prompt
+	// Set environment variable for system prompt, using the absolute path to the temp file
 	cmd.Env = append(os.Environ(), "GEMINI_SYSTEM_MD="+sysPromptFile.Name())
 
 	// Pipe the formatted input to gemini-cli's stdin
@@ -131,38 +149,41 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-
 	var sessionID string
+	var fullResponseBuilder strings.Builder
+
 	if isStream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
+	}
 
-		scanner := bufio.NewScanner(stdout) // Use bufio.Scanner for line-by-line reading
-		for scanner.Scan() {
-			line := scanner.Text()
-			if len(line) == 0 {
-				continue // Skip empty lines
-			}
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) == 0 {
+			continue
+		}
 
-			var geminiEvent GeminiStreamEvent
-			if err := json.Unmarshal([]byte(line), &geminiEvent); err != nil {
-				log.Printf("Error unmarshalling gemini stream event line '%s': %v", line, err)
-				continue
-			}
+		var geminiEvent GeminiStreamEvent
+		if err := json.Unmarshal([]byte(line), &geminiEvent); err != nil {
+			log.Printf("Error unmarshalling gemini stream event line '%s': %v", line, err)
+			continue
+		}
 
-			if geminiEvent.Type == "init" {
-				sessionID = geminiEvent.SessionID
-			}
+		if geminiEvent.Type == "init" {
+			sessionID = geminiEvent.SessionID
+		}
 
-			if geminiEvent.Type == "message" && geminiEvent.Role == "assistant" && geminiEvent.Delta {
-				// Translate gemini delta to OpenAI SSE format
+		if geminiEvent.Type == "message" && geminiEvent.Role == "assistant" && geminiEvent.Delta {
+			if isStream {
+				// Streaming mode: Send SSE chunk immediately
 				chunk := OpenAICompletionChunk{
-					ID:      "chatcmpl-" + generateID(), // Placeholder ID
+					ID:      "chatcmpl-" + generateID(),
 					Object:  "chat.completion.chunk",
 					Created: time.Now().Unix(),
-					Model:   model, // Use the model name sent to gemini-cli
+					Model:   model,
 					Choices: []OpenAIChoice{
 						{
 							Index: 0,
@@ -173,29 +194,21 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 					},
 				}
 				jsonChunk, _ := json.Marshal(chunk)
-				fmt.Fprintf(w, "data: %s\n\n", jsonChunk) // Double newline for SSE format
+				fmt.Fprintf(w, "data: %s\n\n", jsonChunk)
 				w.(http.Flusher).Flush()
+			} else {
+				// Non-streaming mode: Buffer the content
+				fullResponseBuilder.WriteString(geminiEvent.Content)
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("Error reading Gemini CLI stdout stream: %v", err)
-		}
+	}
 
-	} else {
-		// Non-streaming response
-		var geminiResponse GeminiCompletionResponse
-		// Read the entire stdout for non-streaming
-		outputBytes, readErr := io.ReadAll(stdout)
-		if readErr != nil {
-			http.Error(w, fmt.Sprintf("Failed to read gemini-cli output: %v", readErr), http.StatusInternalServerError)
-			return
-		}
-		
-		if err := json.Unmarshal(outputBytes, &geminiResponse); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to decode gemini-cli response '%s': %v", string(outputBytes), err), http.StatusInternalServerError)
-			return
-		}
+	if err := scanner.Err(); err != nil {
+		log.Printf("Error reading Gemini CLI stdout stream: %v", err)
+	}
 
+	// Handle final response for non-streaming requests
+	if !isStream {
 		response := OpenAICompletionResponse{
 			ID:      "chatcmpl-" + generateID(),
 			Object:  "chat.completion",
@@ -204,27 +217,26 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Choices: []OpenAIChoice{
 				{
 					Index: 0,
-					Message: OpenAIMessage{
+					Message: OpenAIMessage{ // OpenAIMessage here for output should behave as simple string content
 						Role:    "assistant",
-						Content: geminiResponse.Response,
+						Content: json.RawMessage(strconv.Quote(fullResponseBuilder.String())), // Corrected assignment
 					},
 				},
 			},
-			// TODO: Populate Usage based on geminiResponse.Stats if available and mapped
+			// Usage stats could technically be parsed from the 'result' event in the stream if needed
 		}
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 	}
 
 	if err := cmd.Wait(); err != nil {
 		log.Printf("gemini-cli command finished with error: %v", err)
-		// For non-stream, if an error occurred during cmd.Wait, and we haven't sent response, send 500.
-		// For stream, error will be logged but not propagated as headers already sent.
 		if !isStream && w.Header().Get("Content-Type") != "application/json" { // Check if response was already written
 			http.Error(w, fmt.Sprintf("Gemini CLI process failed: %v", err), http.StatusInternalServerError)
 		}
 	}
 
-	// Clean up session in a goroutine
+	// Clean up session in a goroutine using the captured sessionID
 	if sessionID != "" {
 		go func(id string) {
 			deleteCmd := exec.Command(geminiCLI, "--delete-session", id)
@@ -257,11 +269,11 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(models)
 }
 
-// parseMessages extracts the system prompt and formats the remaining messages for gemini-cli.
-func parseMessages(messages []OpenAIMessage) (string, string) {
+// parseMessages extracts the system prompt and formats the remaining messages for gemini-cli, handling multimodal content.
+func parseMessages(messages []OpenAIMessage, requestTempDir string) (string, string, error) {
 	var systemPromptBuilder strings.Builder
 	var transcriptBuilder strings.Builder
-	
+
 	// Default system prompt if none provided
 	defaultSystemPrompt := "You are a helpful AI assistant."
 	hasSystemPrompt := false
@@ -269,15 +281,42 @@ func parseMessages(messages []OpenAIMessage) (string, string) {
 	for _, msg := range messages {
 		switch msg.Role {
 		case "system":
-			systemPromptBuilder.WriteString(msg.Content + "\n")
-			hasSystemPrompt = true
+			// System messages are assumed to be text-only
+			if len(msg.ParsedContent) > 0 && msg.ParsedContent[0].Type == "text" {
+				systemPromptBuilder.WriteString(msg.ParsedContent[0].Text + "\n")
+				hasSystemPrompt = true
+			}
 		case "user":
-			transcriptBuilder.WriteString("User: " + msg.Content + "\n")
+			transcriptBuilder.WriteString("User: ")
+			for _, part := range msg.ParsedContent {
+				switch part.Type {
+				case "text":
+					transcriptBuilder.WriteString(part.Text)
+				case "image_url":
+					if part.ImageURL != nil && part.ImageURL.URL != "" {
+						imagePath, err := handleImageURL(part.ImageURL.URL, requestTempDir)
+							if err != nil {
+								return "", "", fmt.Errorf("failed to handle image URL: %w", err)
+							}
+						transcriptBuilder.WriteString(fmt.Sprintf(" @%s", imagePath))
+					} else {
+						log.Printf("Warning: image_url content part found but ImageURL or URL is empty.")
+					}
+				}
+			}
+			transcriptBuilder.WriteString("\n")
 		case "assistant":
-			transcriptBuilder.WriteString("Model: " + msg.Content + "\n")
+			transcriptBuilder.WriteString("Model: ")
+			for _, part := range msg.ParsedContent {
+				// Assuming assistant messages are primarily text-based for now
+				if part.Type == "text" {
+					transcriptBuilder.WriteString(part.Text)
+				}
+			}
+			transcriptBuilder.WriteString("\n")
 		}
 	}
-	
+
 	systemPrompt := systemPromptBuilder.String()
 	if !hasSystemPrompt {
 		systemPrompt = defaultSystemPrompt
@@ -287,8 +326,103 @@ func parseMessages(messages []OpenAIMessage) (string, string) {
 	if len(messages) > 0 && messages[len(messages)-1].Role == "user" {
 		transcriptBuilder.WriteString("Model:")
 	}
+
+	return systemPrompt, transcriptBuilder.String(), nil
+}
+
+// handleImageURL downloads/decodes an image and saves it to a temp file in the specified directory.
+func handleImageURL(imageURL string, destDir string) (string, error) {
+	// Generate a unique filename
+	fileName := "image-" + generateID()
+	var fileExtension string
+
+	var imageData []byte
+	var err error
+
+	if strings.HasPrefix(imageURL, "data:image/") {
+		// Base64 Data URI
+		parts := strings.SplitN(imageURL, ";base64,", 2)
+		if len(parts) != 2 {
+			return "", fmt.Errorf("invalid base64 image data URI")
+		}
+
+		// Extract MIME type for extension
+	mimeType := strings.TrimPrefix(parts[0], "data:")
+	slashIndex := strings.Index(mimeType, "/")
+	if slashIndex != -1 {
+		fileExtension = "." + mimeType[slashIndex+1:]
+		}
+		
+		imageData, err = base64.StdEncoding.DecodeString(parts[1])
+		if err != nil {
+			return "", fmt.Errorf("failed to decode base64 image: %w", err)
+		}
+	} else if strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://") {
+		// Remote URL
+		req, err := http.NewRequest("GET", imageURL, nil)
+		if err != nil {
+			return "", fmt.Errorf("failed to create request for image URL: %w", err)
+		}
+		// Set User-Agent to avoid 403 Forbidden from some servers
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("failed to download image from URL: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("failed to download image, status code: %d", resp.StatusCode)
+		}
+		
+		imageData, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("failed to read image data from response: %w", err)
+		}
+
+		// Infer extension from Content-Type header
+		contentType := resp.Header.Get("Content-Type")
+		if strings.Contains(contentType, "image/jpeg") {
+			fileExtension = ".jpg"
+		} else if strings.Contains(contentType, "image/png") {
+			fileExtension = ".png"
+		} else if strings.Contains(contentType, "image/gif") {
+			fileExtension = ".gif"
+		} else if strings.Contains(contentType, "image/webp") {
+			fileExtension = ".webp"
+		} else {
+			// Fallback if Content-Type is not specific enough, or try to guess from URL
+			log.Printf("Warning: Could not infer image extension from Content-Type: %s. Trying from URL.", contentType)
+			u, parseErr := url.Parse(imageURL)
+			if parseErr == nil {
+				ext := filepath.Ext(u.Path)
+				if ext != "" {
+					fileExtension = ext
+				}
+			}
+			if fileExtension == "" {
+				fileExtension = ".bin" // Default to binary if no extension found
+			}
+		}
+
+	} else {
+		return "", fmt.Errorf("unsupported image URL scheme: %s", imageURL)
+	}
+
+	// Ensure extension is not empty
+	if fileExtension == "" {
+		fileExtension = ".dat" // Default if no extension could be determined
+	}
+
+	fullPath := filepath.Join(destDir, fileName+fileExtension)
+	if err := os.WriteFile(fullPath, imageData, 0644); err != nil {
+		return "", fmt.Errorf("failed to write image to temp file: %w", err)
+	}
 	
-	return systemPrompt, transcriptBuilder.String()
+	// Return the filename relative to the temp directory (which is cmd.Dir)
+	return fileName + fileExtension, nil
 }
 
 // generateID creates a simple placeholder ID for OpenAI responses
