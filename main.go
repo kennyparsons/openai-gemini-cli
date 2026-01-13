@@ -18,8 +18,10 @@ import (
 )
 
 const (
-	defaultPort = "8080"
-	geminiCLI   = "gemini" // Assuming 'gemini' is the executable name
+	defaultPort    = "8080"
+	nodeExec       = "node"
+	geminiScript   = "/Users/kenny.parsons/dmz/kennyparsons/gemini-speed/build/gemini-fast-v3.mjs"
+	leanPromptPath = "/Users/kenny.parsons/.gemini/prompts/lean_system.md"
 )
 
 func main() {
@@ -81,8 +83,18 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// No need to os.Remove(sysPromptFile.Name()) here, as os.RemoveAll(requestTempDir) will handle it
 
+	// Read Lean System Prompt
+	leanPromptContent, err := os.ReadFile(leanPromptPath)
+	var finalSystemPrompt string
+	if err != nil {
+		log.Printf("Warning: Failed to read lean system prompt from %s: %v", leanPromptPath, err)
+		finalSystemPrompt = systemPromptContent
+	} else {
+		finalSystemPrompt = string(leanPromptContent) + "\n" + systemPromptContent
+	}
+
 	// Write system prompt to file
-	if _, err := sysPromptFile.WriteString(systemPromptContent); err != nil {
+	if _, err := sysPromptFile.WriteString(finalSystemPrompt); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to write to temp system prompt file: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -90,7 +102,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Build the gemini-cli command
 	// Always use stream-json to ensure we can capture the session ID for cleanup
-	args := []string{"--output-format", "stream-json"}
+	args := []string{geminiScript, "--output-format", "stream-json"}
 
 	// Use specified model, or default if not provided/recognized
 	model := req.Model
@@ -108,11 +120,11 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(args, "-m", model)
 	// Explicitly disable extensions and MCP servers
-	args = append(args, "--extensions", "", "--allowed-mcp-server-names", "")
+	args = append(args, "--extensions", "[]", "--allowed-mcp-server-names", "[]")
 
 	log.Printf("Calling gemini-cli with args: %v", args)
 
-	cmd := exec.Command(geminiCLI, args...)
+	cmd := exec.Command(nodeExec, args...)
 	// Set gemini-cli's working directory to the request's temp directory
 	cmd.Dir = requestTempDir
 
@@ -239,7 +251,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Clean up session in a goroutine using the captured sessionID
 	if sessionID != "" {
 		go func(id string) {
-			deleteCmd := exec.Command(geminiCLI, "--delete-session", id)
+			deleteCmd := exec.Command(nodeExec, geminiScript, "--delete-session", id)
 			output, err := deleteCmd.CombinedOutput()
 			if err != nil {
 				log.Printf("Failed to delete session %s: %v, Output: %s", id, err, string(output))
