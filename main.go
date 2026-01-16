@@ -22,6 +22,7 @@ const (
 	nodeExec       = "node"
 	geminiScript   = "/Users/kenny.parsons/dmz/kennyparsons/gemini-speed/build/gemini-fast-v3.mjs"
 	leanPromptPath = "/Users/kenny.parsons/.gemini/prompts/lean_system.md"
+	maxScanTokenSize = 10 * 1024 * 1024 // 10MB buffer for scanner
 )
 
 func main() {
@@ -153,6 +154,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Read stderr in a goroutine to prevent blocking
 	go func() {
 		scanner := bufio.NewScanner(stderr)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, maxScanTokenSize)
 		for scanner.Scan() {
 			log.Printf("Gemini CLI stderr: %s", scanner.Text())
 		}
@@ -172,6 +175,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	scanner := bufio.NewScanner(stdout)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, maxScanTokenSize)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if len(line) == 0 {
