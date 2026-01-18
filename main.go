@@ -18,17 +18,28 @@ import (
 )
 
 const (
-	defaultPort    = "8080"
-	nodeExec       = "node"
-	geminiScript   = "/Users/kenny.parsons/dmz/kennyparsons/gemini-speed/build/gemini-fast-v3.mjs"
-	leanPromptPath = "/Users/kenny.parsons/.gemini/prompts/lean_system.md"
+	defaultPort      = "8080"
+	nodeExec         = "node"
+	defaultGeminiScript = "/Users/kenny.parsons/dmz/kennyparsons/gemini-speed/build/gemini-fast-v3.mjs"
+	leanPromptPath   = "/Users/kenny.parsons/.gemini/prompts/lean_system.md"
 	maxScanTokenSize = 10 * 1024 * 1024 // 10MB buffer for scanner
 )
+
+var geminiScript string
 
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = defaultPort
+	}
+
+	// Initialize geminiScript from environment variable or use default
+	geminiScript = os.Getenv("GEMINI_SCRIPT_PATH")
+	if geminiScript == "" {
+		geminiScript = defaultGeminiScript
+		log.Printf("GEMINI_SCRIPT_PATH not set, using default: %s", geminiScript)
+	} else {
+		log.Printf("Using GEMINI_SCRIPT_PATH from environment: %s", geminiScript)
 	}
 
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
