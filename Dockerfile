@@ -17,14 +17,19 @@ RUN curl -L -o /gemini-fast.js https://github.com/kennyparsons/fast-gemini/relea
 # --- Stage 2: Final (Node Alpine) ---
 FROM node:lts-alpine
 
-# 1. Copy artifacts from the builder stage
+# 1. Create directory for lean system prompt
+RUN mkdir -p /root/.gemini
+
+# 2. Copy artifacts from the builder stage
 COPY --from=builder /openai-gemini-proxy /openai-gemini-proxy
 COPY --from=builder /gemini-fast.js /gemini-fast.js
+COPY --from=builder /src/lean_system.md /root/.gemini/lean_system.md
 
-# 2. Configure Environment
+# 3. Configure Environment
 ENV GEMINI_SCRIPT_PATH="/gemini-fast.js"
+ENV LEAN_PROMPT_PATH="/root/.gemini/lean_system.md"
 WORKDIR /workspace
 
-# 3. Set Entrypoint
+# 4. Set Entrypoint
 ENTRYPOINT ["/openai-gemini-proxy"]
 
