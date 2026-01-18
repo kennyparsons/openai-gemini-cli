@@ -13,6 +13,9 @@ RUN git clone https://github.com/kennyparsons/openai-gemini-cli.git . \
 # 2. Download the JS Script
 RUN curl -L -o /gemini-fast.js https://github.com/kennyparsons/fast-gemini/releases/latest/download/gemini-fast.js
 
+# 3. Copy lean_system.md from build context (local repo)
+COPY lean_system.md /lean_system.md
+
 
 # --- Stage 2: Final (Node Alpine) ---
 FROM node:lts-alpine
@@ -23,7 +26,7 @@ RUN mkdir -p /root/.gemini
 # 2. Copy artifacts from the builder stage
 COPY --from=builder /openai-gemini-proxy /openai-gemini-proxy
 COPY --from=builder /gemini-fast.js /gemini-fast.js
-COPY --from=builder /src/lean_system.md /root/.gemini/lean_system.md
+COPY --from=builder /lean_system.md /root/.gemini/lean_system.md
 
 # 3. Configure Environment
 ENV GEMINI_SCRIPT_PATH="/gemini-fast.js"
