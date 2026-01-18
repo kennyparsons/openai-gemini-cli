@@ -18,14 +18,17 @@ import (
 )
 
 const (
-	defaultPort      = "8080"
-	nodeExec         = "node"
-	defaultGeminiScript = "/Users/kenny.parsons/dmz/kennyparsons/gemini-speed/build/gemini-fast-v3.mjs"
-	leanPromptPath   = "/Users/kenny.parsons/.gemini/prompts/lean_system.md"
-	maxScanTokenSize = 10 * 1024 * 1024 // 10MB buffer for scanner
+	defaultPort             = "8080"
+	nodeExec                = "node"
+	defaultGeminiScript     = "/Users/kenny.parsons/dmz/kennyparsons/gemini-speed/build/gemini-fast-v3.mjs"
+	defaultLeanPromptPath   = "/root/.gemini/lean_system.md"
+	maxScanTokenSize        = 10 * 1024 * 1024 // 10MB buffer for scanner
 )
 
-var geminiScript string
+var (
+	geminiScript   string
+	leanPromptPath string
+)
 
 func main() {
 	port := os.Getenv("PORT")
@@ -40,6 +43,15 @@ func main() {
 		log.Printf("GEMINI_SCRIPT_PATH not set, using default: %s", geminiScript)
 	} else {
 		log.Printf("Using GEMINI_SCRIPT_PATH from environment: %s", geminiScript)
+	}
+
+	// Initialize leanPromptPath from environment variable or use default
+	leanPromptPath = os.Getenv("LEAN_PROMPT_PATH")
+	if leanPromptPath == "" {
+		leanPromptPath = defaultLeanPromptPath
+		log.Printf("LEAN_PROMPT_PATH not set, using default: %s", leanPromptPath)
+	} else {
+		log.Printf("Using LEAN_PROMPT_PATH from environment: %s", leanPromptPath)
 	}
 
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
