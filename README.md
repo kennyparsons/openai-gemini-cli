@@ -1,6 +1,10 @@
 # OpenAI Gemini Proxy
 
-An OpenAI-compatible proxy server that translates OpenAI API requests to Google's Gemini CLI application. Instead of calling the Gemini API directly, this proxy leverages the gemini-cli (or gemini-fast.js) to interact with Gemini models.
+An OpenAI-compatible proxy server that translates OpenAI API requests to Google's Gemini CLI application. Instead of calling the Gemini API directly, this proxy leverages the [gemini-fast](https://github.com/kennyparsons/fast-gemini) CLI to interact with Gemini models.
+
+## Important Note
+
+This is an extremely opinionated proxy/shim. It's not for everyone and even this README will have some holes. If you have questions or run into issues, please [open an issue](https://github.com/kennyparsons/openai-gemini-cli/issues).
 
 ## Why Use This Proxy?
 
