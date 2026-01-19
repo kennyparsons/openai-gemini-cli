@@ -7,8 +7,6 @@ An OpenAI-compatible proxy server that translates OpenAI API requests to Google'
 This proxy is beneficial in scenarios where:
 - The Gemini CLI has more generous API call limits on the free tier compared to direct API access
 - Enterprise CLI options are supported but direct API calls are not available
-- You want to use OpenAI-compatible tools and libraries with Gemini models
-- You need a consistent interface across different LLM providers
 
 ## Features
 
@@ -107,10 +105,12 @@ curl http://localhost:8080/v1/chat/completions \
 
 ### Supported Models
 
-The proxy supports all Gemini models available through the CLI application. Common models include:
-- `gemini-2.0-flash-exp`
-- `gemini-1.5-pro`
-- `gemini-1.5-flash`
+The proxy explicitly supports the following models:
+- `gemini-2.5-flash`
+- `gemini-2.5-pro`
+- `gemini-3-pro-preview`
+
+Any unsupported or unrecognized model name will automatically fall back to `gemini-2.5-flash`.
 
 ## Development
 
