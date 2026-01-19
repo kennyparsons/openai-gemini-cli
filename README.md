@@ -1,15 +1,24 @@
 # OpenAI Gemini Proxy
 
-An OpenAI-compatible proxy server for Google's Gemini API. This proxy allows you to use Gemini models with any OpenAI-compatible client by translating requests between the OpenAI and Gemini API formats.
+An OpenAI-compatible proxy server that translates OpenAI API requests to Google's Gemini CLI application. Instead of calling the Gemini API directly, this proxy leverages the gemini-cli (or gemini-fast.js) to interact with Gemini models.
+
+## Why Use This Proxy?
+
+This proxy is beneficial in scenarios where:
+- The Gemini CLI has more generous API call limits on the free tier compared to direct API access
+- Enterprise CLI options are supported but direct API calls are not available
+- You want to use OpenAI-compatible tools and libraries with Gemini models
+- You need a consistent interface across different LLM providers
 
 ## Features
 
 - OpenAI-compatible API endpoints (`/v1/chat/completions`, `/v1/models`)
+- Translates OpenAI v1 API format to Gemini CLI commands
 - Support for streaming and non-streaming responses
 - Configurable via environment variables
 - Docker support with multi-stage builds
 - Customizable system prompts
-- Works with Google Cloud Vertex AI
+- Works with Google Cloud Vertex AI through the CLI
 
 ## Quick Start
 
@@ -71,6 +80,17 @@ For local development, authenticate using:
 gcloud auth application-default login
 ```
 
+## How It Works
+
+1. Client sends an OpenAI-compatible request to the proxy
+2. Proxy translates the request to Gemini CLI format
+3. Proxy executes the gemini-fast.js CLI application with the translated request
+4. CLI application communicates with Google's Gemini service
+5. Proxy translates the CLI response back to OpenAI format
+6. Client receives an OpenAI-compatible response
+
+This architecture allows you to benefit from CLI-specific features, quotas, and authentication methods while maintaining compatibility with OpenAI tooling.
+
 ## API Usage
 
 The proxy implements OpenAI-compatible endpoints. Use it with any OpenAI client:
@@ -87,7 +107,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ### Supported Models
 
-The proxy supports all Gemini models available through the Vertex AI API. Common models include:
+The proxy supports all Gemini models available through the CLI application. Common models include:
 - `gemini-2.0-flash-exp`
 - `gemini-1.5-pro`
 - `gemini-1.5-flash`
@@ -115,8 +135,8 @@ go build -o openai-gemini-proxy
 ## Docker
 
 The Docker image uses a multi-stage build:
-1. Builder stage: Clones the repository and builds the Go binary
-2. Final stage: Minimal Node.js Alpine image with the proxy and gemini-fast.js
+1. Builder stage: Clones the repository, builds the Go proxy binary, and downloads gemini-fast.js
+2. Final stage: Minimal Node.js Alpine image with the proxy binary and CLI application
 
 Build the image:
 ```bash
@@ -130,6 +150,16 @@ docker run -p 8080:8080 \
   -v ~/.config/gcloud:/root/.config/gcloud \
   gemini-proxy
 ```
+
+## Architecture
+
+```
+OpenAI Client → Proxy Server (Go) → gemini-fast.js (Node.js) → Google Gemini Service
+                     ↓
+              Translates API formats
+```
+
+The proxy acts as a translation layer between OpenAI's API format and the Gemini CLI application, allowing you to use CLI-specific features and quotas while maintaining OpenAI compatibility.
 
 ## License
 
