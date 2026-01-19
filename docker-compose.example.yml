@@ -1,0 +1,63 @@
+# OpenAI-Gemini Proxy Docker Compose Configuration
+#
+# This configuration includes all available environment variables with their defaults.
+# Adjust values based on your deployment scenario:
+#
+# For High-Traffic Deployments:
+#   - Increase MAX_CONCURRENT_REQUESTS (e.g., 20-30)
+#   - Increase CLEANUP_WORKERS proportionally (e.g., 5-10)
+#   - Increase REQUEST_TIMEOUT_MIN if processing large images (e.g., 10)
+#   - Increase MAX_IMAGE_SIZE_MB if needed (e.g., 50)
+#
+# For Low-Resource Environments:
+#   - Decrease MAX_CONCURRENT_REQUESTS (e.g., 5)
+#   - Decrease CLEANUP_WORKERS (e.g., 2)
+#   - Decrease TEMP_FILE_MAX_AGE_MIN for aggressive cleanup (e.g., 30)
+#
+# For Private Networks:
+#   - Set DISABLE_SSRF_PROTECTION=true (already configured below)
+
+version: '3.8'
+
+services:
+  gemini:
+    build: .
+    image: gemini-proxy
+    ports:
+      - "8080:8080"
+    environment:
+      # Google Cloud Configuration
+      - GOOGLE_CLOUD_PROJECT=replaceme
+      - GOOGLE_CLOUD_LOCATION=global
+      - GOOGLE_GENAI_USE_VERTEXAI=true
+
+      # Server Configuration
+      - PORT=8080
+      # GEMINI_SCRIPT_PATH and LEAN_PROMPT_PATH are set in Dockerfile
+
+      # Security Configuration
+      - DISABLE_SSRF_PROTECTION=true  # Safe for private networks
+      - MAX_IMAGE_SIZE_MB=10
+      - IMAGE_DOWNLOAD_TIMEOUT_SEC=30
+      - MAX_REQUEST_BODY_SIZE_MB=1
+
+      # Concurrency Configuration
+      - MAX_CONCURRENT_REQUESTS=10
+      - CLEANUP_WORKERS=3
+      - CLEANUP_QUEUE_SIZE=100
+
+      # Temp Directory Configuration
+      - TEMP_CLEANUP_INTERVAL_MIN=5
+      - TEMP_FILE_MAX_AGE_MIN=60
+
+      # Timeout Configuration
+      - REQUEST_TIMEOUT_MIN=5
+    volumes:
+      - .:/workspace
+      # Mount Google Cloud Credentials
+      - /root/.config/gcloud/application_default_credentials.json:/root/.config/gcloud/application_default_credentials.json
+      # Mount Gemini Settings
+      - /root/.gemini/settings.json:/root/.gemini/settings.json
+    stdin_open: true
+    tty: true
+

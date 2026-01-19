@@ -3,3 +3,6 @@ gemini-cli-openai-proxy
 openai-gemini-proxy
 server.log
 poqw.file
+
+# Docker Compose - use docker-compose.example.yml as template
+docker-compose.yml

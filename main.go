@@ -2,11 +2,15 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,51 +18,102 @@ import (
 	"path/filepath"
 	"strconv" // Added for strconv.Quote
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	defaultPort             = "8080"
-	nodeExec                = "node"
-	defaultGeminiScript     = "/Users/kenny.parsons/dmz/kennyparsons/gemini-speed/build/gemini-fast-v3.mjs"
-	defaultLeanPromptPath   = "/root/.gemini/lean_system.md"
-	maxScanTokenSize        = 10 * 1024 * 1024 // 10MB buffer for scanner
+	nodeExec              = "node"
+	maxScanTokenSize      = 10 * 1024 * 1024 // 10MB buffer for scanner
 )
 
+// Configuration with defaults (overridable via environment variables)
+type Config struct {
+	// Server configuration
+	Port                    string
+	GeminiScriptPath        string
+	LeanPromptPath          string
+
+	// Security configuration
+	MaxImageSize            int64
+	ImageDownloadTimeout    int
+	MaxRequestBodySize      int64
+	DisableSSRFProtection   bool
+
+	// Concurrency configuration
+	MaxConcurrentRequests   int
+	CleanupWorkers          int
+	CleanupQueueSize        int
+
+	// Temp directory configuration
+	TempCleanupInterval     int // minutes
+	TempFileMaxAge          int // minutes
+
+	// Request timeout configuration
+	RequestTimeout          int // minutes
+}
+
 var (
-	geminiScript   string
-	leanPromptPath string
+	config               Config
+	baseTempDir          string
+	cleanupQueue         chan string
+	cleanupWaitGroup     sync.WaitGroup
+	requestCounter       uint64
+	requestSemaphore     chan struct{}
+	activeRequests       int64
 )
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = defaultPort
+	// Load configuration from environment variables
+	config = loadConfig()
+	printConfig()
+
+	// Startup validation
+	if err := validateStartup(); err != nil {
+		log.Fatalf("Startup validation failed: %v", err)
 	}
 
-	// Initialize geminiScript from environment variable or use default
-	geminiScript = os.Getenv("GEMINI_SCRIPT_PATH")
-	if geminiScript == "" {
-		geminiScript = defaultGeminiScript
-		log.Printf("GEMINI_SCRIPT_PATH not set, using default: %s", geminiScript)
-	} else {
-		log.Printf("Using GEMINI_SCRIPT_PATH from environment: %s", geminiScript)
+	// Initialize base temp directory
+	if err := initTempDirectory(); err != nil {
+		log.Fatalf("Failed to initialize temp directory: %v", err)
 	}
 
-	// Initialize leanPromptPath from environment variable or use default
-	leanPromptPath = os.Getenv("LEAN_PROMPT_PATH")
-	if leanPromptPath == "" {
-		leanPromptPath = defaultLeanPromptPath
-		log.Printf("LEAN_PROMPT_PATH not set, using default: %s", leanPromptPath)
-	} else {
-		log.Printf("Using LEAN_PROMPT_PATH from environment: %s", leanPromptPath)
+	// Initialize request semaphore for concurrency limiting
+	requestSemaphore = make(chan struct{}, config.MaxConcurrentRequests)
+
+	// Initialize session cleanup queue
+	cleanupQueue = make(chan string, config.CleanupQueueSize)
+
+	// Start cleanup workers
+	for i := 0; i < config.CleanupWorkers; i++ {
+		go sessionCleanupWorker(i)
 	}
 
-	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
-	http.HandleFunc("/v1/models", handleModels) // Dummy models endpoint
+	// Start background temp directory cleanup goroutine
+	go backgroundTempCleanup()
 
-	log.Printf("Server listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	// Defer cleanup in correct order: cleanup queue FIRST, then temp directory
+	defer func() {
+		log.Printf("Shutting down: closing cleanup queue")
+		close(cleanupQueue)
+		cleanupWaitGroup.Wait()
+		log.Printf("All cleanup workers finished")
+		cleanupTempDirectory()
+		log.Printf("Temp directory cleaned up")
+	}()
+
+	// Wrap handlers with timeout to prevent hanging requests
+	http.Handle("/v1/chat/completions", http.TimeoutHandler(
+		http.HandlerFunc(handleChatCompletions),
+		time.Duration(config.RequestTimeout)*time.Minute,
+		"Request timeout: Gemini API took too long to respond",
+	))
+	http.HandleFunc("/v1/models", handleModels)
+	http.HandleFunc("/health", handleHealth)
+
+	log.Printf("Server listening on :%s", config.Port)
+	log.Fatal(http.ListenAndServe(":"+config.Port, nil))
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +121,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Limit request body size
+	r.Body = http.MaxBytesReader(w, r.Body, config.MaxRequestBodySize)
 
 	var req OpenAICompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -82,9 +140,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Determine if streaming is requested
 	isStream := req.Stream
 
-	// Create a unique temporary directory for this request
-	requestTempDir, err := os.MkdirTemp("", "gemini-proxy-request-*")
-	if err != nil {
+	// Create a unique temporary directory for this request using base temp dir
+	requestID := generateID()
+	requestTempDir := filepath.Join(baseTempDir, requestID)
+	if err := os.MkdirAll(requestTempDir, 0755); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create request temporary directory: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -108,10 +167,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// No need to os.Remove(sysPromptFile.Name()) here, as os.RemoveAll(requestTempDir) will handle it
 
 	// Read Lean System Prompt
-	leanPromptContent, err := os.ReadFile(leanPromptPath)
+	leanPromptContent, err := os.ReadFile(config.LeanPromptPath)
 	var finalSystemPrompt string
 	if err != nil {
-		log.Printf("Warning: Failed to read lean system prompt from %s: %v", leanPromptPath, err)
+		log.Printf("Warning: Failed to read lean system prompt from %s: %v", config.LeanPromptPath, err)
 		finalSystemPrompt = systemPromptContent
 	} else {
 		finalSystemPrompt = string(leanPromptContent) + "\n" + systemPromptContent
@@ -126,7 +185,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Build the gemini-cli command
 	// Always use stream-json to ensure we can capture the session ID for cleanup
-	args := []string{geminiScript, "--output-format", "stream-json"}
+	args := []string{config.GeminiScriptPath, "--output-format", "stream-json"}
 
 	// Use specified model, or default if not provided/recognized
 	model := req.Model
@@ -147,6 +206,16 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	args = append(args, "--extensions", "[]", "--allowed-mcp-server-names", "[]")
 
 	log.Printf("Calling gemini-cli with args: %v", args)
+
+	// Acquire semaphore slot (blocks if at max concurrency)
+	active := atomic.AddInt64(&activeRequests, 1)
+	log.Printf("Acquiring process slot (active: %d/%d)", active, config.MaxConcurrentRequests)
+	requestSemaphore <- struct{}{}
+	defer func() {
+		<-requestSemaphore
+		active := atomic.AddInt64(&activeRequests, -1)
+		log.Printf("Released process slot (active: %d/%d)", active, config.MaxConcurrentRequests)
+	}()
 
 	cmd := exec.Command(nodeExec, args...)
 	// Set gemini-cli's working directory to the request's temp directory
@@ -276,17 +345,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Clean up session in a goroutine using the captured sessionID
+	// Queue session cleanup using the captured sessionID
 	if sessionID != "" {
-		go func(id string) {
-			deleteCmd := exec.Command(nodeExec, geminiScript, "--delete-session", id)
-			output, err := deleteCmd.CombinedOutput()
-			if err != nil {
-				log.Printf("Failed to delete session %s: %v, Output: %s", id, err, string(output))
-			} else {
-				log.Printf("Successfully deleted session %s", id)
-			}
-		}(sessionID)
+		select {
+		case cleanupQueue <- sessionID:
+			log.Printf("Queued session %s for cleanup", sessionID)
+		default:
+			log.Printf("Warning: Cleanup queue full, session %s may leak", sessionID)
+		}
 	}
 }
 
@@ -307,6 +373,84 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	json.NewEncoder(w).Encode(models)
+}
+
+// handleHealth provides a health check endpoint
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	health := make(map[string]interface{})
+	health["status"] = "ok"
+
+	// Check if gemini script exists
+	if _, err := os.Stat(config.GeminiScriptPath); err != nil {
+		health["status"] = "degraded"
+		health["gemini_script"] = "not found"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		health["gemini_script"] = "ok"
+	}
+
+	// Check if node is available
+	if _, err := exec.LookPath(nodeExec); err != nil {
+		health["status"] = "degraded"
+		health["node"] = "not found"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		health["node"] = "ok"
+	}
+
+	// Check if temp directory is writable
+	tempDir := os.TempDir()
+	testFile := filepath.Join(tempDir, ".gemini-proxy-health-check")
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+		health["status"] = "degraded"
+		health["temp_dir"] = "not writable"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		os.Remove(testFile)
+		health["temp_dir"] = "ok"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(health)
+}
+
+// validateStartup performs startup validation checks
+func validateStartup() error {
+	// Check if gemini script exists
+	if _, err := os.Stat(config.GeminiScriptPath); err != nil {
+		return fmt.Errorf("gemini script not found at %s: %w", config.GeminiScriptPath, err)
+	}
+	log.Printf("✓ Gemini script found: %s", config.GeminiScriptPath)
+
+	// Check if node is installed
+	if _, err := exec.LookPath(nodeExec); err != nil {
+		return fmt.Errorf("node executable not found: %w", err)
+	}
+	log.Printf("✓ Node.js found")
+
+	// Check if temp directory is writable
+	tempDir := os.TempDir()
+	testFile := filepath.Join(tempDir, ".gemini-proxy-startup-test")
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+		return fmt.Errorf("temp directory not writable: %w", err)
+	}
+	os.Remove(testFile)
+	log.Printf("✓ Temp directory writable: %s", tempDir)
+
+	// Warn if lean prompt path doesn't exist (non-fatal)
+	if _, err := os.Stat(config.LeanPromptPath); err != nil {
+		log.Printf("⚠ Lean prompt file not found at %s (will use default system prompt)", config.LeanPromptPath)
+	} else {
+		log.Printf("✓ Lean prompt file found: %s", config.LeanPromptPath)
+	}
+
+	log.Printf("✓ All startup validations passed")
+	return nil
 }
 
 // parseMessages extracts the system prompt and formats the remaining messages for gemini-cli, handling multimodal content.
@@ -387,18 +531,38 @@ func handleImageURL(imageURL string, destDir string) (string, error) {
 		}
 
 		// Extract MIME type for extension
-	mimeType := strings.TrimPrefix(parts[0], "data:")
-	slashIndex := strings.Index(mimeType, "/")
-	if slashIndex != -1 {
-		fileExtension = "." + mimeType[slashIndex+1:]
+		mimeType := strings.TrimPrefix(parts[0], "data:")
+		slashIndex := strings.Index(mimeType, "/")
+		if slashIndex != -1 {
+			fileExtension = "." + mimeType[slashIndex+1:]
 		}
-		
+
 		imageData, err = base64.StdEncoding.DecodeString(parts[1])
 		if err != nil {
 			return "", fmt.Errorf("failed to decode base64 image: %w", err)
 		}
+
+		// Check size after decoding
+		if int64(len(imageData)) > config.MaxImageSize {
+			return "", fmt.Errorf("decoded image size (%d bytes) exceeds maximum allowed size (%d bytes)", len(imageData), config.MaxImageSize)
+		}
 	} else if strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://") {
 		// Remote URL
+
+		// SSRF protection - block private IP ranges using proper IP parsing
+		parsedURL, err := url.Parse(imageURL)
+		if err != nil {
+			return "", fmt.Errorf("invalid image URL: %w", err)
+		}
+
+		// Validate hostname is not a private IP (unless SSRF protection is disabled)
+		if !config.DisableSSRFProtection {
+			host := parsedURL.Hostname()
+			if err := validatePublicHost(host); err != nil {
+				return "", err
+			}
+		}
+
 		req, err := http.NewRequest("GET", imageURL, nil)
 		if err != nil {
 			return "", fmt.Errorf("failed to create request for image URL: %w", err)
@@ -406,7 +570,9 @@ func handleImageURL(imageURL string, destDir string) (string, error) {
 		// Set User-Agent to avoid 403 Forbidden from some servers
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 
-		client := &http.Client{}
+		client := &http.Client{
+			Timeout: time.Duration(config.ImageDownloadTimeout) * time.Second,
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return "", fmt.Errorf("failed to download image from URL: %w", err)
@@ -416,10 +582,22 @@ func handleImageURL(imageURL string, destDir string) (string, error) {
 		if resp.StatusCode != http.StatusOK {
 			return "", fmt.Errorf("failed to download image, status code: %d", resp.StatusCode)
 		}
-		
-		imageData, err = io.ReadAll(resp.Body)
+
+		// Check Content-Length header if available
+		if resp.ContentLength > config.MaxImageSize {
+			return "", fmt.Errorf("image size (%d bytes) exceeds maximum allowed size (%d bytes)", resp.ContentLength, config.MaxImageSize)
+		}
+
+		// Use LimitReader to prevent reading more than config.MaxImageSize
+		limitedReader := io.LimitReader(resp.Body, config.MaxImageSize+1)
+		imageData, err = io.ReadAll(limitedReader)
 		if err != nil {
 			return "", fmt.Errorf("failed to read image data from response: %w", err)
+		}
+
+		// Check if we hit the limit
+		if int64(len(imageData)) > config.MaxImageSize {
+			return "", fmt.Errorf("image size exceeds maximum allowed size (%d bytes)", config.MaxImageSize)
 		}
 
 		// Infer extension from Content-Type header
@@ -465,7 +643,269 @@ func handleImageURL(imageURL string, destDir string) (string, error) {
 	return fileName + fileExtension, nil
 }
 
-// generateID creates a simple placeholder ID for OpenAI responses
+// generateID creates a unique ID for requests and responses
+// Uses combination of timestamp, atomic counter, and random bytes to ensure uniqueness
 func generateID() string {
-	return fmt.Sprintf("%x", time.Now().UnixNano())
+	// Atomic counter for uniqueness within same millisecond
+	counter := atomic.AddUint64(&requestCounter, 1)
+
+	// Random bytes for additional entropy
+	randomBytes := make([]byte, 8)
+	if _, err := rand.Read(randomBytes); err != nil {
+		// Fallback to timestamp + counter if random fails
+		return fmt.Sprintf("%x-%x", time.Now().UnixNano(), counter)
+	}
+
+	// Combine timestamp, counter, and random bytes
+	return fmt.Sprintf("%x-%x-%s", time.Now().UnixNano(), counter, hex.EncodeToString(randomBytes))
+}
+
+// validatePublicHost checks if a hostname resolves to a public IP address
+// Returns error if the host is localhost, private IP, or link-local
+func validatePublicHost(host string) error {
+	// Check for localhost variations
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
+		return fmt.Errorf("access to localhost is not allowed")
+	}
+
+	// Try to parse as IP first
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return validatePublicIP(ip)
+	}
+
+	// If not an IP, resolve the hostname
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("failed to resolve hostname: %w", err)
+	}
+
+	// Check all resolved IPs
+	for _, ip := range ips {
+		if err := validatePublicIP(ip); err != nil {
+			return fmt.Errorf("hostname resolves to private IP %s: %w", ip, err)
+		}
+	}
+
+	return nil
+}
+
+// validatePublicIP checks if an IP is public (not private, loopback, or link-local)
+func validatePublicIP(ip net.IP) error {
+	if ip.IsLoopback() {
+		return fmt.Errorf("loopback addresses are not allowed")
+	}
+	if ip.IsPrivate() {
+		return fmt.Errorf("private IP addresses are not allowed")
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return fmt.Errorf("link-local addresses are not allowed")
+	}
+	if ip.IsMulticast() {
+		return fmt.Errorf("multicast addresses are not allowed")
+	}
+	return nil
+}
+
+// initTempDirectory creates and initializes the base temp directory
+func initTempDirectory() error {
+	tempDir := filepath.Join(os.TempDir(), "gemini-proxy")
+
+	// Clean up any stale directories from previous runs
+	if _, err := os.Stat(tempDir); err == nil {
+		log.Printf("Cleaning up stale temp directory: %s", tempDir)
+		if err := os.RemoveAll(tempDir); err != nil {
+			return fmt.Errorf("failed to clean up stale temp directory: %w", err)
+		}
+	}
+
+	// Create fresh temp directory
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return fmt.Errorf("failed to create base temp directory: %w", err)
+	}
+
+	baseTempDir = tempDir
+	log.Printf("✓ Base temp directory initialized: %s", baseTempDir)
+	return nil
+}
+
+// cleanupTempDirectory removes the base temp directory on shutdown
+func cleanupTempDirectory() {
+	if baseTempDir != "" {
+		log.Printf("Cleaning up base temp directory: %s", baseTempDir)
+		if err := os.RemoveAll(baseTempDir); err != nil {
+			log.Printf("Warning: Failed to clean up base temp directory: %v", err)
+		}
+	}
+}
+
+// backgroundTempCleanup periodically cleans up old request directories
+func backgroundTempCleanup() {
+	ticker := time.NewTicker(time.Duration(config.TempCleanupInterval) * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if baseTempDir == "" {
+			continue
+		}
+
+		entries, err := os.ReadDir(baseTempDir)
+		if err != nil {
+			log.Printf("Warning: Failed to read temp directory for cleanup: %v", err)
+			continue
+		}
+
+		now := time.Now()
+		cleanedCount := 0
+
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+
+			fullPath := filepath.Join(baseTempDir, entry.Name())
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			// Remove directories older than configured max age
+			if now.Sub(info.ModTime()) > time.Duration(config.TempFileMaxAge)*time.Minute {
+				if err := os.RemoveAll(fullPath); err != nil {
+					log.Printf("Warning: Failed to clean up old temp directory %s: %v", fullPath, err)
+				} else {
+					cleanedCount++
+				}
+			}
+		}
+
+		if cleanedCount > 0 {
+			log.Printf("Background cleanup: removed %d old temp directories", cleanedCount)
+		}
+	}
+}
+
+// sessionCleanupWorker processes session cleanup requests from the queue
+func sessionCleanupWorker(workerID int) {
+	cleanupWaitGroup.Add(1)
+	defer cleanupWaitGroup.Done()
+
+	log.Printf("Session cleanup worker %d started", workerID)
+
+	for sessionID := range cleanupQueue {
+		// Retry logic with exponential backoff
+		maxRetries := 3
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+			deleteCmd := exec.CommandContext(ctx, nodeExec, config.GeminiScriptPath, "--delete-session", sessionID)
+			output, err := deleteCmd.CombinedOutput()
+			cancel()
+
+			if err == nil {
+				log.Printf("Worker %d: Successfully deleted session %s", workerID, sessionID)
+				break
+			}
+
+			if attempt < maxRetries {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				log.Printf("Worker %d: Failed to delete session %s (attempt %d/%d): %v. Retrying in %v...",
+					workerID, sessionID, attempt, maxRetries, err, backoff)
+				time.Sleep(backoff)
+			} else {
+				log.Printf("Worker %d: Failed to delete session %s after %d attempts: %v, Output: %s",
+					workerID, sessionID, maxRetries, err, string(output))
+			}
+		}
+	}
+
+	log.Printf("Session cleanup worker %d stopped", workerID)
+}
+
+// loadConfig loads configuration from environment variables with defaults
+func loadConfig() Config {
+	cfg := Config{
+		// Defaults
+		Port:                  getEnv("PORT", "8080"),
+		GeminiScriptPath:      getEnv("GEMINI_SCRIPT_PATH", "gemini-fast.js"),
+		LeanPromptPath:        getEnv("LEAN_PROMPT_PATH", "/root/.gemini/lean_system.md"),
+		MaxImageSize:          getEnvInt64("MAX_IMAGE_SIZE_MB", 10) * 1024 * 1024,
+		ImageDownloadTimeout:  getEnvInt("IMAGE_DOWNLOAD_TIMEOUT_SEC", 30),
+		MaxRequestBodySize:    getEnvInt64("MAX_REQUEST_BODY_SIZE_MB", 1) * 1024 * 1024,
+		DisableSSRFProtection: getEnvBool("DISABLE_SSRF_PROTECTION", false),
+		MaxConcurrentRequests: getEnvInt("MAX_CONCURRENT_REQUESTS", 10),
+		CleanupWorkers:        getEnvInt("CLEANUP_WORKERS", 3),
+		CleanupQueueSize:      getEnvInt("CLEANUP_QUEUE_SIZE", 100),
+		TempCleanupInterval:   getEnvInt("TEMP_CLEANUP_INTERVAL_MIN", 5),
+		TempFileMaxAge:        getEnvInt("TEMP_FILE_MAX_AGE_MIN", 60),
+		RequestTimeout:        getEnvInt("REQUEST_TIMEOUT_MIN", 5),
+	}
+
+	return cfg
+}
+
+// printConfig logs the current configuration
+func printConfig() {
+	log.Printf("=== Configuration ===")
+	log.Printf("Server:")
+	log.Printf("  PORT: %s", config.Port)
+	log.Printf("  GEMINI_SCRIPT_PATH: %s", config.GeminiScriptPath)
+	log.Printf("  LEAN_PROMPT_PATH: %s", config.LeanPromptPath)
+	log.Printf("Security:")
+	log.Printf("  MAX_IMAGE_SIZE: %d MB", config.MaxImageSize/(1024*1024))
+	log.Printf("  IMAGE_DOWNLOAD_TIMEOUT: %d seconds", config.ImageDownloadTimeout)
+	log.Printf("  MAX_REQUEST_BODY_SIZE: %d MB", config.MaxRequestBodySize/(1024*1024))
+	if config.DisableSSRFProtection {
+		log.Printf("  SSRF_PROTECTION: ⚠️  DISABLED (private network mode)")
+	} else {
+		log.Printf("  SSRF_PROTECTION: ✓ ENABLED")
+	}
+	log.Printf("Concurrency:")
+	log.Printf("  MAX_CONCURRENT_REQUESTS: %d", config.MaxConcurrentRequests)
+	log.Printf("  CLEANUP_WORKERS: %d", config.CleanupWorkers)
+	log.Printf("  CLEANUP_QUEUE_SIZE: %d", config.CleanupQueueSize)
+	log.Printf("Temp Directory:")
+	log.Printf("  CLEANUP_INTERVAL: %d minutes", config.TempCleanupInterval)
+	log.Printf("  FILE_MAX_AGE: %d minutes", config.TempFileMaxAge)
+	log.Printf("Timeouts:")
+	log.Printf("  REQUEST_TIMEOUT: %d minutes", config.RequestTimeout)
+	log.Printf("====================")
+}
+
+// Helper functions for environment variable parsing
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+		log.Printf("Warning: Invalid integer value for %s: %s, using default: %d", key, value, defaultValue)
+	}
+	return defaultValue
+}
+
+func getEnvInt64(key string, defaultValue int64) int64 {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return intValue
+		}
+		log.Printf("Warning: Invalid int64 value for %s: %s, using default: %d", key, value, defaultValue)
+	}
+	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolValue, err := strconv.ParseBool(value); err == nil {
+			return boolValue
+		}
+		log.Printf("Warning: Invalid boolean value for %s: %s, using default: %t", key, value, defaultValue)
+	}
+	return defaultValue
 }

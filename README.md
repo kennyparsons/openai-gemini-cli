@@ -32,13 +32,18 @@ git clone https://github.com/kennyparsons/openai-gemini-cli.git
 cd openai-gemini-cli
 ```
 
-2. Update `docker-compose.yml` with your Google Cloud project ID:
+2. Create your docker-compose.yml from the example:
+```bash
+cp docker-compose.example.yml docker-compose.yml
+```
+
+3. Update `docker-compose.yml` with your Google Cloud project ID:
 ```yaml
 environment:
   - GOOGLE_CLOUD_PROJECT=your-project-id
 ```
 
-3. Build and run:
+4. Build and run:
 ```bash
 docker compose up --build
 ```
@@ -61,12 +66,81 @@ GEMINI_SCRIPT_PATH=/path/to/gemini-fast.js ./openai-gemini-proxy
 
 ### Environment Variables
 
+**Server Configuration:**
 - `PORT` - Server port (default: `8080`)
 - `GEMINI_SCRIPT_PATH` - Path to the gemini-fast.js script (required)
 - `LEAN_PROMPT_PATH` - Path to the lean system prompt file (default: `/root/.gemini/lean_system.md`)
+
+**Google Cloud Configuration:**
 - `GOOGLE_CLOUD_PROJECT` - Google Cloud project ID (required for Vertex AI)
 - `GOOGLE_CLOUD_LOCATION` - Google Cloud location (default: `global`)
 - `GOOGLE_GENAI_USE_VERTEXAI` - Enable Vertex AI (default: `true`)
+
+**Security Configuration:**
+- `DISABLE_SSRF_PROTECTION` - Set to `true` to disable SSRF protection for private network deployments (default: `false`)
+  - **Warning:** Only disable this in trusted private networks (e.g., home servers)
+  - When enabled (default), blocks image downloads from private IPs, localhost, and link-local addresses
+  - When disabled, allows image downloads from any IP address
+- `MAX_IMAGE_SIZE_MB` - Maximum image size in megabytes (default: `10`)
+- `IMAGE_DOWNLOAD_TIMEOUT_SEC` - Image download timeout in seconds (default: `30`)
+- `MAX_REQUEST_BODY_SIZE_MB` - Maximum request body size in megabytes (default: `1`)
+
+**Concurrency Configuration:**
+- `MAX_CONCURRENT_REQUESTS` - Maximum concurrent Gemini CLI processes (default: `10`)
+  - Controls how many requests can be processed simultaneously
+  - Prevents resource exhaustion under high load
+  - Requests queue when limit is reached
+- `CLEANUP_WORKERS` - Number of session cleanup worker threads (default: `3`)
+- `CLEANUP_QUEUE_SIZE` - Size of the cleanup queue buffer (default: `100`)
+
+**Temp Directory Configuration:**
+- `TEMP_CLEANUP_INTERVAL_MIN` - Background cleanup interval in minutes (default: `5`)
+- `TEMP_FILE_MAX_AGE_MIN` - Maximum age of temp files in minutes before cleanup (default: `60`)
+
+**Timeout Configuration:**
+- `REQUEST_TIMEOUT_MIN` - Request timeout in minutes (default: `5`)
+  - Maximum time allowed for a single request to complete
+  - Prevents hanging requests from consuming resources
+
+### Configuration Best Practices
+
+**For Docker Deployments:**
+All configuration is done via environment variables. Example `docker-compose.yml`:
+
+```yaml
+environment:
+  - PORT=8080
+  - GEMINI_SCRIPT_PATH=/app/gemini-fast.js
+  - MAX_CONCURRENT_REQUESTS=20
+  - MAX_IMAGE_SIZE_MB=50
+  - DISABLE_SSRF_PROTECTION=true  # For private networks only
+```
+
+**For High-Traffic Deployments:**
+- Increase `MAX_CONCURRENT_REQUESTS` (e.g., `20` or `30`)
+- Increase `CLEANUP_WORKERS` proportionally (e.g., `5` or `10`)
+- Increase `REQUEST_TIMEOUT_MIN` if processing large images (e.g., `10`)
+- Increase `MAX_IMAGE_SIZE_MB` if needed (e.g., `50`)
+
+**For Low-Resource Environments:**
+- Decrease `MAX_CONCURRENT_REQUESTS` (e.g., `5`)
+- Decrease `CLEANUP_WORKERS` (e.g., `2`)
+- Decrease `TEMP_FILE_MAX_AGE_MIN` for more aggressive cleanup (e.g., `30`)
+
+**Configuration Logging:**
+On startup, the proxy logs all active configuration values for easy verification:
+```
+=== Configuration ===
+Server:
+  PORT: 8080
+  GEMINI_SCRIPT_PATH: /app/gemini-fast.js
+Security:
+  MAX_IMAGE_SIZE: 10 MB
+  SSRF_PROTECTION: ✓ ENABLED
+Concurrency:
+  MAX_CONCURRENT_REQUESTS: 10
+...
+```
 
 ### Google Cloud Authentication
 
